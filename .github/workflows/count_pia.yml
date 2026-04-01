@@ -1,0 +1,99 @@
+name: Category Total Count Scraper - PIA VPN
+
+on:
+  workflow_dispatch:
+    inputs:
+      preferred_country:
+        description: "PIA VPN region"
+        required: false
+        default: "us_california"
+      start_index:
+        description: "Start category index (inclusive)"
+        required: false
+        default: "0"
+      end_index:
+        description: "End category index (inclusive)"
+        required: false
+        default: "999"
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      VPN_ENABLED: "1"
+      GITHUB_TOKEN: ${{ secrets.BOT_STORAGE_TOKEN }}
+      GITHUB_REPO: "Zaiinalii/fiverr-bot-storage"
+      START_INDEX: ${{ github.event.inputs.start_index }}
+      END_INDEX: ${{ github.event.inputs.end_index }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install curl_cffi requests certifi
+
+      - name: Install OpenVPN
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openvpn unzip jq
+          openvpn --version | head -1
+
+      - name: Download PIA OpenVPN Configs
+        run: |
+          sudo mkdir -p /etc/openvpn/pia
+          sudo curl -fSL -o /tmp/pia.zip https://www.privateinternetaccess.com/openvpn/openvpn.zip
+          sudo unzip -o /tmp/pia.zip -d /etc/openvpn/pia
+          CONFIG_COUNT=$(ls /etc/openvpn/pia/*.ovpn 2>/dev/null | wc -l)
+          echo "Downloaded $CONFIG_COUNT PIA region configs"
+          echo "OPENVPN_CONFIG_DIR=/etc/openvpn/pia" >> $GITHUB_ENV
+          echo "OPENVPN_AUTH_FILE=/etc/openvpn/auth.txt" >> $GITHUB_ENV
+
+      - name: Connect PIA VPN
+        run: |
+          sudo modprobe tun || true
+          echo "${{ secrets.PIA_USER }}" | sudo tee /etc/openvpn/auth.txt > /dev/null
+          printf '%s\n' '${{ secrets.PIA_PASS }}' | sudo tee -a /etc/openvpn/auth.txt > /dev/null
+          sudo chmod 600 /etc/openvpn/auth.txt
+
+          REGION="${{ github.event.inputs.preferred_country }}"
+          INITIAL="/etc/openvpn/pia/${REGION}.ovpn"
+
+          if [ ! -f "$INITIAL" ]; then
+            INITIAL=$(ls /etc/openvpn/pia/us_*.ovpn 2>/dev/null | shuf -n1)
+            if [ -z "$INITIAL" ]; then
+              INITIAL=$(ls /etc/openvpn/pia/*.ovpn | shuf -n1)
+            fi
+          fi
+          echo "Connecting to: $(basename $INITIAL)"
+
+          sudo openvpn \
+            --config "$INITIAL" \
+            --auth-user-pass /etc/openvpn/auth.txt \
+            --auth-nocache \
+            --daemon \
+            --log /tmp/openvpn.log \
+            --connect-retry 3 \
+            --connect-timeout 30
+
+          echo "Waiting for VPN..."
+          for i in $(seq 1 30); do
+            if grep -q "Initialization Sequence Completed" /tmp/openvpn.log 2>/dev/null; then
+              echo "VPN connected!"
+              curl -s http://ip-api.com/json/?fields=query,country | jq .
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run Category Count Scraper
+        run: python category_count_scraper.py
