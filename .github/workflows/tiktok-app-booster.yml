@@ -1,0 +1,200 @@
+name: TikTok Mobile App Live Stream Multi-Viewer & Auto-Liker
+
+on:
+  workflow_dispatch:
+    inputs:
+      stream_url:
+        description: 'Target TikTok Live Stream URL, @username, or Room ID'
+        required: true
+        default: 'https://www.tiktok.com/@tiktok/live'
+      duration_minutes:
+        description: 'Watch duration per instance in minutes (e.g. 30, 60, 180)'
+        required: true
+        default: '60'
+      likes_per_minute:
+        description: 'Heart likes tapping rate per minute (e.g. 60, 120, 240)'
+        required: true
+        default: '120'
+      runner_count:
+        description: 'Number of parallel Android AVD runners to launch per account (1 to 20, default 1 for FGOS-grade stability)'
+        required: false
+        default: '1'
+      runner_ids:
+        description: 'Comma-separated specific runner IDs to run (e.g. 0 or 0,2). If empty, uses runner_count'
+        required: false
+        default: ''
+      vpn_provider:
+        description: 'VPN Provider (none, nordvpn, pia)'
+        required: false
+        default: 'none'
+      emulator_provider:
+        description: 'Android Emulator Provider (avd or ldplayer)'
+        required: false
+        default: 'avd'
+      run_vpn_tests:
+        description: 'Run comprehensive PIA VPN & Android Egress Integration Tests (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  generate-matrix:
+    name: Generate Runner Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        env:
+          RUNNER_IDS: ${{ github.event.inputs.runner_ids }}
+          COUNT: ${{ github.event.inputs.runner_count || '1' }}
+        run: |
+          echo "Generating runner matrix (runner_ids='$RUNNER_IDS', count=$COUNT)..."
+          RUNNERS=$(python3 -c "
+          import json, os, sys
+          try:
+              count = max(1, min(20, int(os.environ.get('COUNT', '1').strip() or '1')))
+          except ValueError:
+              count = 1
+
+          ids_str = os.environ.get('RUNNER_IDS', '').strip()
+          if not ids_str:
+              runners = list(range(count))
+          else:
+              parts = [p.strip() for p in ids_str.split(',') if p.strip()]
+              if not parts:
+                  runners = list(range(count))
+              else:
+                  seen = set()
+                  runners = []
+                  invalid = []
+                  for p in parts:
+                      if not p.isdigit():
+                          invalid.append(p)
+                          continue
+                      val = int(p)
+                      if val < 0 or val > 20:
+                          invalid.append(p)
+                          continue
+                      if val not in seen:
+                          seen.add(val)
+                          runners.append(val)
+                  if invalid:
+                      sys.stderr.write(f'Workflow Error: Invalid runner_ids encountered: {invalid}. Expected comma-separated integers between 0 and 20 (e.g. 0 or 0,2).\n')
+                      sys.exit(1)
+                  if not runners:
+                      sys.stderr.write('Workflow Error: No valid runner IDs could be parsed.\n')
+                      sys.exit(1)
+
+          print(json.dumps(runners))
+          ")
+          echo "matrix=$RUNNERS" >> $GITHUB_OUTPUT
+
+  launch-mobile-viewers:
+    needs: generate-matrix
+    name: Milestone 1 Android 14 Runner #${{ matrix.runner_id }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_id: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Enable KVM Hardware Acceleration
+        run: |
+          echo '=== Checking KVM Availability ==='
+          if [ -e /dev/kvm ]; then
+            sudo chmod 777 /dev/kvm
+            echo "KVM is enabled and accessible"
+          fi
+
+      - name: Set up Android SDK & Gradle Cache
+        uses: actions/cache@v4
+        id: avd-cache
+        with:
+          path: |
+            ~/.android/avd/*
+            ~/.android/adb*
+          key: avd-34-x86_64-v2
+
+      # ───────── OPENVPN & PIA CONFIGS ─────────
+      - name: Install OpenVPN & Download PIA Configs
+        if: ${{ github.event.inputs.vpn_provider == 'pia' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openvpn unzip jq
+          sudo mkdir -p /etc/openvpn/pia
+          sudo curl -fSL -o /tmp/pia.zip https://www.privateinternetaccess.com/openvpn/openvpn.zip
+          sudo unzip -o /tmp/pia.zip -d /etc/openvpn/pia
+          sudo modprobe tun || true
+          
+          if [ -n "${{ secrets.PIA_USER }}" ]; then
+            echo "${{ secrets.PIA_USER }}" | sudo tee /etc/openvpn/auth.txt > /dev/null
+            printf '%s\n' '${{ secrets.PIA_PASS }}' | sudo tee -a /etc/openvpn/auth.txt > /dev/null
+            sudo chmod 600 /etc/openvpn/auth.txt
+          fi
+          
+          echo "OPENVPN_CONFIG_DIR=/etc/openvpn/pia" >> $GITHUB_ENV
+          echo "OPENVPN_AUTH_FILE=/etc/openvpn/auth.txt" >> $GITHUB_ENV
+
+      - name: Make Scripts Executable
+        run: chmod +x ./scripts/*.sh
+
+      - name: Create AVD & Run Android 14 Automation
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          avd-name: TikTok_Booster_14_${{ matrix.runner_id }}
+          force-avd-creation: false
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -camera-back none
+          disable-animations: true
+          script: ./scripts/run_emulator_session.sh
+        env:
+          RUNNER_INDEX: ${{ matrix.runner_id }}
+          STREAM_URL: ${{ github.event.inputs.stream_url }}
+          DURATION_MIN: ${{ github.event.inputs.duration_minutes }}
+          LIKES_RATE: ${{ github.event.inputs.likes_per_minute }}
+          VPN_PROVIDER: ${{ github.event.inputs.vpn_provider }}
+          RUN_VPN_TESTS: ${{ github.event.inputs.run_vpn_tests }}
+          VPN_TOKEN: ${{ secrets.VPN_TOKEN }}
+          PIA_USER: ${{ secrets.PIA_USER }}
+          PIA_PASS: ${{ secrets.PIA_PASS }}
+          OPENVPN_CONFIG_DIR: /etc/openvpn/pia
+          OPENVPN_AUTH_FILE: /etc/openvpn/auth.txt
+          TIKTOK_APK_URL: ${{ secrets.TIKTOK_APK_URL || 'https://d.apkpure.net/b/APK/com.zhiliaoapp.musically?version=latest' }}
+          TIKTOK_BOOSTER_BACKEND_URL: ${{ secrets.TIKTOK_BOOSTER_BACKEND_URL || secrets.FGOS_BACKEND_URL || 'https://api.fgos.site/tiktok' }}
+          FGOS_BACKEND_URL: ${{ secrets.FGOS_BACKEND_URL || 'https://api.fgos.site/tiktok' }}
+          RUNNER_SECRET: ${{ secrets.RUNNER_SECRET || 'runner_token' }}
+
+      - name: Upload Stream Verification Snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stream-snapshot-runner-${{ matrix.runner_id }}
+          path: last_stream_view.png
+          if-no-files-found: ignore
+
+      - name: Notify Central Backend Run Complete
+        if: always()
+        run: |
+          echo "=== [TEARDOWN] Notifying central backend of job completion (${{ job.status }}) ==="
+          curl -s -X POST "${{ secrets.TIKTOK_BOOSTER_BACKEND_URL || secrets.FGOS_BACKEND_URL || 'https://api.fgos.site/tiktok' }}/api/runners/workflow-done" \
+            -H "Content-Type: application/json" \
+            -H "x-runner-secret: ${{ secrets.RUNNER_SECRET || 'runner_token' }}" \
+            -d "{\"repo_name\":\"${{ github.repository }}\",\"run_id\":${{ github.run_id }},\"status\":\"${{ job.status }}\",\"runner_index\":${{ matrix.runner_id }}}" || true
+
