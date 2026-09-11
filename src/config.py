@@ -32,14 +32,15 @@ class AppConfig:
         self.ldplayer_adb_host: str = os.getenv("LDPLAYER_ADB_HOST", "127.0.0.1")
         self.ldplayer_adb_port: Optional[int] = int(os.getenv("LDPLAYER_ADB_PORT")) if os.getenv("LDPLAYER_ADB_PORT") else None
         self.adb_device_id: Optional[str] = os.getenv("ADB_DEVICE_ID", None)
+        self.tiktok_apk_url: str = os.getenv("TIKTOK_APK_URL") or "https://api.fgos.site/tiktok/assets/tiktok.apk"
+        self.custom_apk_url: str = self.tiktok_apk_url
         self.tiktok_package: str = os.getenv("TIKTOK_PACKAGE", "com.zhiliaoapp.musically")
-        self.tiktok_apk_url: Optional[str] = os.getenv("TIKTOK_APK_URL", None)
-        self.custom_apk_url: Optional[str] = self.tiktok_apk_url
         
         # Network / VPN / Proxy / Backend
-        self.vpn_provider: str = os.getenv("VPN_PROVIDER", "none").lower() # none, nordvpn, pia
+        self.vpn_provider: str = os.getenv("VPN_PROVIDER", "pia").lower() # none, nordvpn, pia
         self.vpn_token: Optional[str] = os.getenv("VPN_TOKEN", None)
         self.vpn_country: str = os.getenv("VPN_COUNTRY", "United_States")
+        self.vpn_location: Optional[str] = os.getenv("VPN_LOCATION", None)
         self.openvpn_config_dir: str = os.getenv("OPENVPN_CONFIG_DIR", "/etc/openvpn/pia")
         self.openvpn_auth_file: str = os.getenv("OPENVPN_AUTH_FILE", "/etc/openvpn/auth.txt")
         self.pia_user: Optional[str] = os.getenv("PIA_USER", None)
@@ -66,6 +67,7 @@ class AppConfig:
         parser.add_argument("--emulator-provider", type=str, help="Emulator provider (avd or ldplayer)")
         parser.add_argument("--ldplayer-instance", type=int, help="LDPlayer instance index")
         parser.add_argument("--backend-url", type=str, help="TikTok Booster Central Backend API Base URL")
+        parser.add_argument("--vpn-location", type=str, help="Specific PIA City/Region to pin (e.g. us_california, us_chicago, uk_london)")
         
         args, _ = parser.parse_known_args()
         
@@ -93,6 +95,8 @@ class AppConfig:
             config.batch_size = args.batch_size
         if args.device_id:
             config.adb_device_id = args.device_id
+        if args.vpn_location:
+            config.vpn_location = args.vpn_location
             
         return config
 
