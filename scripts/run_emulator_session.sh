@@ -30,8 +30,30 @@ if [ "$SDK_VER" != "34" ]; then
 fi
 echo "[PASS] Android 14 (API 34) verified successfully!"
 
-# 2. Fast Tap script
-echo "=== [2/4] Setting Up Fast Tap Acceleration Script ==="
+# Enable root access on AVD (required for app session backup/restore on /data/data)
+echo "Enabling ADB root permissions on Android 14 emulator..."
+adb root 2>/dev/null || true
+adb wait-for-device 2>/dev/null || true
+sleep 1
+
+# Configure Clean HD Portrait Display Resolution (720x1280 @ 240 DPI)
+echo "Configuring HD Android Display Resolution (720x1280 @ 240dpi)..."
+adb shell wm size 720x1280 || true
+adb shell wm density 240 || true
+sleep 1
+
+# 2. Pre-install Official Standard TikTok APK
+echo "=== [2/5] Checking Official Standard TikTok APK Installation ==="
+adb shell pm uninstall com.zhiliaoapp.musically.go 2>/dev/null || true
+if ! adb shell pm list packages | grep -q 'package:com.zhiliaoapp.musically$'; then
+    if [ -f "/tmp/tiktok.apk" ]; then
+        echo "Installing official TikTok APK from /tmp/tiktok.apk..."
+        adb install -r -d -g /tmp/tiktok.apk || true
+    fi
+fi
+
+# 3. Fast Tap script
+echo "=== [3/5] Setting Up Fast Tap Acceleration Script ==="
 if [ -f "./scripts/fast_tap.sh" ]; then
     chmod +x ./scripts/fast_tap.sh
     adb push ./scripts/fast_tap.sh /data/local/tmp/fast_tap.sh
@@ -61,10 +83,17 @@ RUNNER_INDEX="${RUNNER_INDEX:-0}"
 STREAM_URL="${STREAM_URL:-https://www.tiktok.com/@tiktok/live}"
 DURATION_MIN="${DURATION_MIN:-60}"
 LIKES_RATE="${LIKES_RATE:-120}"
+VPN_LOCATION="${VPN_LOCATION:-}"
+
+ARGS=(
+  --stream-url "$STREAM_URL"
+  --duration "$DURATION_MIN"
+  --likes-per-min "$LIKES_RATE"
+  --runner-index "$RUNNER_INDEX"
+)
+if [ -n "$VPN_LOCATION" ]; then
+  ARGS+=(--vpn-location "$VPN_LOCATION")
+fi
 
 export PYTHONPATH="${PYTHONPATH:-.}:."
-python -m src.main \
-  --stream-url "$STREAM_URL" \
-  --duration "$DURATION_MIN" \
-  --likes-per-min "$LIKES_RATE" \
-  --runner-index "$RUNNER_INDEX"
+python -m src.main "${ARGS[@]}"
