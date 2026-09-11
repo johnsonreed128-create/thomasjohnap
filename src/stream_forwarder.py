@@ -29,11 +29,12 @@ class ScrcpyStreamForwarder:
     Android 14 (scrcpy-server) <-> StreamForwarder <-> Central Backend WebSocket Relay <-> Browser
     """
 
-    def __init__(self, backend_url: str, runner_key: str, token: str = "", command_callback: Optional[Callable[[dict], None]] = None):
+    def __init__(self, backend_url: str, runner_key: str, token: str = "", command_callback: Optional[Callable[[dict], None]] = None, adb_controller=None):
         self.backend_url = backend_url.rstrip("/")
         self.runner_key = runner_key
         self.token = token
         self.command_callback = command_callback
+        self.adb = adb_controller
         self.is_running = False
         self.scrcpy_process = None
         self.video_socket = None
@@ -98,6 +99,14 @@ class ScrcpyStreamForwarder:
         res = subprocess.run(["adb", "forward", f"tcp:{SCRCPY_PORT}", "localabstract:scrcpy"], capture_output=True, text=True)
         logger.info(f"[ADB_FORWARD_CREATED] Port forward active: tcp:{SCRCPY_PORT} -> localabstract:scrcpy ({res.stdout.strip()})")
 
+        # 2. Check if scrcpy-server.jar exists on device; if not, invoke setup_scrcpy.sh
+        chk = subprocess.run(["adb", "shell", "test -f /data/local/tmp/scrcpy-server.jar"], capture_output=True)
+        if chk.returncode != 0:
+            logger.info("[SCRCPY_AUTO_INSTALL] scrcpy-server.jar not on device. Running scripts/setup_scrcpy.sh...")
+            setup_script = os.path.join(os.path.dirname(__file__), "..", "scripts", "setup_scrcpy.sh")
+            if os.path.exists(setup_script):
+                subprocess.run(["bash", setup_script], capture_output=True, text=True)
+
         if self.scrcpy_process and self.scrcpy_process.poll() is None:
             return
 
@@ -148,6 +157,7 @@ class ScrcpyStreamForwarder:
         """Connects to local Scrcpy TCP sockets (Video #1, Control #2) with retry backoff and validates handshake."""
         self._ensure_scrcpy_server()
         self._close_scrcpy_sockets()
+        self.cached_header_chunk = b""
 
         max_attempts = 5
         for attempt in range(1, max_attempts + 1):
@@ -374,6 +384,12 @@ class ScrcpyStreamForwarder:
         except Exception:
             return b""
 
+    def _run_adb_cmd(self, shell_cmd: str, timeout=2):
+        """Executes adb shell command targeted to the active device instance."""
+        if self.adb:
+            return self.adb.shell(shell_cmd, timeout=timeout)
+        return subprocess.run(["adb", "shell", shell_cmd], capture_output=True, timeout=timeout)
+
     def _execute_safe_adb_text(self, text_val: str):
         """Types text into active Android input field with proper shell escaping."""
         if not text_val:
@@ -387,7 +403,7 @@ class ScrcpyStreamForwarder:
                 return
             formatted = text_val.replace(" ", "%s")
             quoted = shlex.quote(formatted)
-            subprocess.run(["adb", "shell", f"input text {quoted}"], capture_output=True, timeout=3)
+            self._run_adb_cmd(f"input text {quoted}", timeout=3)
             logger.info(f"[ADB_TEXT_EXEC] Injected text ({len(text_val)} chars)")
         except Exception as e:
             logger.debug(f"ADB text injection notice: {e}")
@@ -395,6 +411,9 @@ class ScrcpyStreamForwarder:
     async def _receive_control_ws(self, ws):
         """Receives binary Scrcpy control messages and JSON commands from the browser WebSocket."""
         async for msg in ws:
+            if self.adb:
+                self.adb.user_override_until = time.time() + 45
+
             if msg.type == aiohttp.WSMsgType.BINARY and msg.data:
                 data = msg.data
                 handled = False
@@ -437,14 +456,14 @@ class ScrcpyStreamForwarder:
                     if len(data) >= 32 and data[0] == 0x02 and data[1] == 0:
                         x, y = struct.unpack('>II', data[10:18])
                         try:
-                            subprocess.run(["adb", "shell", f"input tap {x} {y}"], capture_output=True, timeout=2)
+                            self._run_adb_cmd(f"input tap {x} {y}", timeout=2)
                             logger.info(f"[ADB_FALLBACK_TOUCH] Executed adb shell input tap {x} {y}")
                         except Exception:
                             pass
                     elif len(data) >= 14 and data[0] == 0x00 and data[1] == 0:
                         keycode = struct.unpack('>I', data[2:6])[0]
                         try:
-                            subprocess.run(["adb", "shell", f"input keyevent {keycode}"], capture_output=True, timeout=2)
+                            self._run_adb_cmd(f"input keyevent {keycode}", timeout=2)
                             logger.info(f"[ADB_FALLBACK_KEY] Executed adb shell input keyevent {keycode}")
                         except Exception:
                             pass
@@ -454,7 +473,7 @@ class ScrcpyStreamForwarder:
                         start_y = int(self.device_height * 0.7) if vscroll < 0 else int(self.device_height * 0.3)
                         end_y = int(self.device_height * 0.3) if vscroll < 0 else int(self.device_height * 0.7)
                         try:
-                            subprocess.run(["adb", "shell", f"input swipe {mid_x} {start_y} {mid_x} {end_y} 200"], capture_output=True, timeout=2)
+                            self._run_adb_cmd(f"input swipe {mid_x} {start_y} {mid_x} {end_y} 200", timeout=2)
                         except Exception:
                             pass
 
@@ -469,16 +488,16 @@ class ScrcpyStreamForwarder:
                     elif action in ["tap", "touch"]:
                         tx = int(payload.get("x", self.device_width // 2))
                         ty = int(payload.get("y", self.device_height // 2))
-                        subprocess.run(["adb", "shell", f"input tap {tx} {ty}"], capture_output=True, timeout=2)
+                        self._run_adb_cmd(f"input tap {tx} {ty}", timeout=2)
                     elif action == "key":
                         k = int(payload.get("keycode", 4))
-                        subprocess.run(["adb", "shell", f"input keyevent {k}"], capture_output=True, timeout=2)
+                        self._run_adb_cmd(f"input keyevent {k}", timeout=2)
                     elif action == "swipe":
                         x1 = int(payload.get("x1", self.device_width // 2))
                         y1 = int(payload.get("y1", int(self.device_height * 0.75)))
                         x2 = int(payload.get("x2", self.device_width // 2))
                         y2 = int(payload.get("y2", int(self.device_height * 0.25)))
-                        subprocess.run(["adb", "shell", f"input swipe {x1} {y1} {x2} {y2} 250"], capture_output=True, timeout=2)
+                        self._run_adb_cmd(f"input swipe {x1} {y1} {x2} {y2} 250", timeout=2)
                     
                     if self.command_callback:
                         self.command_callback(payload)
