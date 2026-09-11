@@ -2,8 +2,8 @@
 # Native on-device fast tap auto-clicker for TikTok Live Mobile
 # Usage: /data/local/tmp/fast_tap.sh <center_x> <center_y> <jitter_px> <taps_per_burst> <burst_sleep_sec> <duration_sec>
 
-X=${1:-540}
-Y=${2:-1100}
+X=${1:-450}
+Y=${2:-650}
 JITTER=${3:-25}
 BURST_COUNT=${4:-10}
 BURST_SLEEP=${5:-2}
@@ -16,8 +16,8 @@ TOTAL_LIKES=0
 echo "Starting native TikTok Live auto-tap loop at ($X, $Y)..."
 
 while [ $(date +%s) -lt $END_TIME ]; do
-    # Verify TikTok is foreground window before tapping
-    if ! dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | grep -q 'com.zhiliaoapp.musically'; then
+    # Verify Native TikTok is foreground window before tapping
+    if ! dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | grep -qE 'com\.zhiliaoapp\.musically|com\.ss\.android\.ugc\.trill'; then
         sleep 1
         continue
     fi
