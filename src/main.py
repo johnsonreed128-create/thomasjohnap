@@ -32,7 +32,9 @@ class TikTokBoosterOrchestrator:
 
     def __init__(self):
         self.config = config
-        self.runner_key = os.getenv('RUNNER_KEY') or f"tiktok-live-booster_runner_{self.config.runner_index}"
+        repo_env = os.getenv("GITHUB_REPOSITORY", "tiktok-live-booster")
+        repo_short = repo_env.split("/")[-1].strip() or "tiktok-live-booster"
+        self.runner_key = os.getenv('RUNNER_KEY') or f"{repo_short}_runner_{self.config.runner_index}"
         self.session_uuid = self.config.session_uuid or f"session_{uuid.uuid4().hex[:12]}"
         self.current_state = RunnerState.INITIALIZING
         self.previous_state = None
@@ -48,10 +50,14 @@ class TikTokBoosterOrchestrator:
         self.adb = ADBController(self.config)
         self.vpn = VPNService(self.config)
         self.auto_login = AutoLoginManager(self.config, self.adb)
-        self.stream_forwarder = ScrcpyStreamForwarder(self.config.backend_url, self.runner_key, token=self.config.runner_secret, command_callback=self._handle_live_ws_command)
+        self.stream_forwarder = ScrcpyStreamForwarder(self.config.backend_url, self.runner_key, token=self.config.runner_secret, command_callback=self._handle_live_ws_command, adb_controller=self.adb)
 
         signal.signal(signal.SIGINT, self._handle_exit)
         signal.signal(signal.SIGTERM, self._handle_exit)
+
+        # Continuous background heartbeat loop ensuring runner telemetry never starves during long tasks
+        self.heartbeat_thread = threading.Thread(target=self._background_heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
 
     def add_step_log(self, step: str, message: str, level: str = "INFO"):
         """Records a timestamped runner operational step log sent to the backend/WebSocket."""
@@ -167,7 +173,7 @@ class TikTokBoosterOrchestrator:
         resolved_from_emulator = False
         if hasattr(self, 'adb') and self.adb and getattr(self.adb, 'device_id', None):
             try:
-                raw = self.adb.shell("curl -s -m 4 http://ip-api.com/json/?fields=status,query,org,isp,city,country")
+                raw = self.adb.shell("toybox wget -q -O - 'http://ip-api.com/json/?fields=status,query,org,isp,city,country' 2>/dev/null || wget -q -O - 'http://ip-api.com/json/?fields=status,query,org,isp,city,country' 2>/dev/null || curl -s -m 4 'http://ip-api.com/json/?fields=status,query,org,isp,city,country'")
                 if raw and "{" in raw:
                     data = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
                     if data.get("status") == "success" and data.get("query"):
@@ -180,7 +186,7 @@ class TikTokBoosterOrchestrator:
                         telemetry["egress_source"] = "android_emulator"
                         resolved_from_emulator = True
                 if not resolved_from_emulator:
-                    raw_fb = self.adb.shell("curl -s -m 4 https://ipwho.is/")
+                    raw_fb = self.adb.shell("toybox wget -q -O - 'https://ipwho.is/' 2>/dev/null || wget -q -O - 'https://ipwho.is/' 2>/dev/null || curl -s -m 4 'https://ipwho.is/'")
                     if raw_fb and "{" in raw_fb:
                         data_fb = json.loads(raw_fb[raw_fb.find("{"):raw_fb.rfind("}")+1])
                         if data_fb.get("success") and data_fb.get("ip"):
@@ -237,8 +243,21 @@ class TikTokBoosterOrchestrator:
         self._net_telemetry_last_check = now
         return telemetry
 
+    def _background_heartbeat_loop(self):
+        """Continuously transmits background heartbeats every 4s so runner stays online during any long task."""
+        while self.is_running:
+            time.sleep(4.0)
+            if not self.is_running:
+                break
+            try:
+                if time.time() - self.last_heartbeat_time >= 3.5:
+                    self.send_heartbeat(include_screenshot=False, reason=getattr(self, 'current_reason', 'Running'))
+            except Exception as e:
+                logger.debug(f"Background heartbeat note: {e}")
+
     def send_heartbeat(self, include_screenshot=False, reason: str = "") -> list:
         """Transmits state heartbeat to central backend and retrieves pending control commands."""
+        self.last_heartbeat_time = time.time()
         url = f"{self.config.backend_url}/api/telemetry/heartbeat"
         screenshot_b64 = None
         if include_screenshot:
@@ -305,6 +324,7 @@ class TikTokBoosterOrchestrator:
         """Immediately executes live control commands received directly over the Scrcpy WebSocket."""
         action = payload.get("action")
         logger.info(f"[LIVE_WS_COMMAND] Executing action {action} directly")
+        self.adb.user_override_until = time.time() + 45
         if action in ["stop", "shutdown"]:
             self.is_running = False
             self.transition_state(RunnerState.STOPPED, reason="Stopped by operator via WebSocket")
@@ -496,10 +516,12 @@ class TikTokBoosterOrchestrator:
 
         self.adb.wake_and_unlock()
 
-        # 4. App Installation Verification
-        self.transition_state(RunnerState.APP_STARTING, reason="Verifying TikTok APK installation and launching app")
+        # 4. App Installation Verification (Native TikTok Mandatory)
+        self.transition_state(RunnerState.APP_STARTING, reason="Verifying Native TikTok APK installation and launching app")
         if not self.adb.ensure_app_installed():
-            logger.warning("TikTok package is not installed. Proceeding with browser fallback.")
+            logger.critical("[-] FATAL: Native TikTok Mobile App is not installed and failed to install. Halting runner.")
+            self.transition_state(RunnerState.ERROR, reason="Native TikTok Mobile App missing or installation failed")
+            sys.exit(1)
 
         # Verify initial emulator network egress
         if self.config.vpn_provider != "none":
@@ -523,6 +545,7 @@ class TikTokBoosterOrchestrator:
                     "LOGIN_REQUIRED": RunnerState.LOGIN_REQUIRED,
                     "LOGIN_STARTED": RunnerState.LOGIN_STARTED,
                     "LOGIN_SUBMITTED": RunnerState.LOGIN_SUBMITTED,
+                    "LOGIN_SUBMITTING": RunnerState.LOGIN_SUBMITTING,
                     "LOGIN_VERIFYING": RunnerState.LOGIN_VERIFYING,
                     "2FA_REQUIRED": RunnerState.TWO_FA_REQUIRED,
                     "AUTHENTICATED": RunnerState.AUTHENTICATED,
@@ -532,7 +555,7 @@ class TikTokBoosterOrchestrator:
                     "LOGIN_RATE_LIMITED": RunnerState.LOGIN_RATE_LIMITED,
                     "LOGIN_BLOCKED": RunnerState.LOGIN_BLOCKED,
                 }
-                mapped_state = state_mapping.get(phase_name, RunnerState.LOGIN_REQUIRED)
+                mapped_state = state_mapping.get(phase_name, RunnerState.LOGIN_SUBMITTING if "SUBMIT" in phase_name else RunnerState.LOGIN_REQUIRED)
                 self.add_step_log("AUTH_PHASE", f"{phase_name}: {phase_reason}")
                 self.transition_state(mapped_state, reason=f"{phase_name}: {phase_reason}")
                 self.send_heartbeat(include_screenshot=True, reason=f"{phase_name}: {phase_reason}")
@@ -547,13 +570,23 @@ class TikTokBoosterOrchestrator:
                 logger.info(f"🔄 [Account Rotation] Evaluating Candidate #{idx+1}/{len(candidate_accounts)}: {masked_email} (ID #{acc_id})")
                 logger.info(f"{'='*60}")
 
-                # 1. Rotate VPN IP for subsequent attempts to provide clean IP
-                if self.config.vpn_provider == "pia" and idx > 0:
-                    self.add_step_log("VPN", f"Rotating VPN IP for Candidate #{idx+1}")
-                    logger.info(f"Rotating PIA VPN IP for Candidate #{idx+1}...")
-                    self.vpn.rotate_vpn()
-                    self.vpn.verify_android_egress(self.adb)
-                    self._refresh_network_telemetry(force=True)
+                # 1. Connect or align to dedicated account VPN location
+                if self.config.vpn_provider == "pia":
+                    target_loc = account.get("vpn_location") or self.config.vpn_location
+                    if target_loc:
+                        exact_cfg = self.vpn.get_exact_location_config(target_loc)
+                        if exact_cfg and self.vpn.current_location != os.path.basename(exact_cfg).replace('.ovpn', ''):
+                            self.add_step_log("VPN", f"Aligning to dedicated account city: {target_loc}")
+                            logger.info(f"🌐 [VPN Pinning] Connecting to account city '{target_loc}' ({os.path.basename(exact_cfg)})...")
+                            self.vpn.connect_openvpn(exact_cfg)
+                            self.vpn.verify_android_egress(self.adb)
+                            self._refresh_network_telemetry(force=True)
+                    elif idx > 0:
+                        self.add_step_log("VPN", f"Rotating VPN IP for Candidate #{idx+1}")
+                        logger.info(f"Rotating PIA VPN IP for Candidate #{idx+1}...")
+                        self.vpn.rotate_vpn()
+                        self.vpn.verify_android_egress(self.adb)
+                        self._refresh_network_telemetry(force=True)
 
                 # 2. Clean slate: Wipe app data
                 self.add_step_log("CLEANUP", f"Wiping app data for clean login slate")
@@ -592,16 +625,17 @@ class TikTokBoosterOrchestrator:
                     # IP Circuit-Breaker: Prevent burning subsequent accounts on dirty/rate-limited IP!
                     if fail_reason == "IP_RATE_LIMITED":
                         if acc_id:
-                            self._report_account_cooldown(acc_id, "Maximum number of attempts reached (IP rate-limited by TikTok)", 30)
+                            self._report_account_cooldown(acc_id, "Maximum number of attempts reached (IP rate-limited by TikTok)", 60)
+                        self.add_step_log("COOLDOWN", f"Account {masked_email} placed in 60m auto-cooldown due to attempt limit", "WARNING")
 
                         can_rotate_ip = (self.config.vpn_provider == "pia") or any(c.get("proxy") for c in candidate_accounts[idx+1:])
-                        if not can_rotate_ip:
-                            self.add_step_log("CIRCUIT_BREAKER", "IP Rate-Limit detected ('Maximum attempts reached'). Halting rotation to protect remaining accounts!", "ERROR")
-                            logger.error("🛑 [IP Circuit Breaker] TikTok blocked egress IP with 'Maximum attempts reached'. Halting rotation to protect pool!")
-                            self.transition_state(RunnerState.LOGIN_RATE_LIMITED, reason="Halting account rotation: Egress IP rate-limited by TikTok ('Maximum attempts reached'). Remaining pool accounts protected.")
-                            break
-                        else:
-                            self.add_step_log("CIRCUIT_BREAKER", "IP rate-limited on current egress. Rotating IP/proxy for next candidate.", "WARNING")
+                        if can_rotate_ip and self.config.vpn_provider == "pia":
+                            self.add_step_log("VPN", "Rotating PIA VPN egress IP to clear rate limit for next candidate...")
+                            self.vpn.rotate_vpn()
+                            self.vpn.verify_android_egress(self.adb)
+                            self._refresh_network_telemetry(force=True)
+                        elif not can_rotate_ip and idx + 1 >= len(candidate_accounts):
+                            self.add_step_log("CIRCUIT_BREAKER", "IP Rate-Limit detected and all candidates exhausted.", "WARNING")
 
                     self.send_heartbeat(include_screenshot=True, reason=f"Account {masked_email} login outcome: {self.current_state}")
                     time.sleep(2)
@@ -609,11 +643,19 @@ class TikTokBoosterOrchestrator:
             if authenticated_account:
                 self._run_stream_session(account=authenticated_account)
             else:
-                logger.warning("[-] Authentication challenge or failure encountered. Keeping remote screen active and entering manual recovery loop...")
-                self._run_manual_recovery_loop(reason=f"Authentication blocked: {self.current_state.value}. Operator intervention available.")
+                logger.error("[-] All candidate accounts failed authentication or are in cooldown. Guest Viewer mode disabled.")
+                self.add_step_log("AUTH_FAILED", "All candidate accounts failed authentication. Halting runner (Guest mode disabled).", "ERROR")
+                self.transition_state(RunnerState.LOGIN_FAILED, reason="Authentication failed for all candidate accounts; guest mode disabled")
+                self.send_heartbeat(include_screenshot=True, reason="All candidate accounts failed authentication")
+                self._notify_workflow_done(status="failed")
+                sys.exit(1)
         else:
-            logger.info("No dedicated account assigned in backend. Running in Guest Viewer mode.")
-            self._run_stream_session(account=None)
+            logger.error("[-] No candidate accounts assigned in backend. Guest Viewer mode disabled.")
+            self.add_step_log("AUTH_FAILED", "No accounts assigned. Halting runner (Guest mode disabled).", "ERROR")
+            self.transition_state(RunnerState.LOGIN_FAILED, reason="No accounts assigned; guest mode disabled")
+            self.send_heartbeat(include_screenshot=True, reason="No accounts assigned")
+            self._notify_workflow_done(status="failed")
+            sys.exit(1)
 
     def _run_manual_recovery_loop(self, reason: str = ""):
         """
@@ -694,11 +736,27 @@ class TikTokBoosterOrchestrator:
 
     def _fetch_candidate_accounts(self) -> list:
         """Fetches candidate enabled TikTok accounts for rotation from central backend API."""
-        accounts = []
-        assigned = self._fetch_assigned_account()
-        if assigned:
-            accounts.append(assigned)
-        return accounts
+        try:
+            url = f"{self.config.backend_url}/api/accounts/runner-assignment/{self.runner_key}"
+            headers = {}
+            if self.config.runner_secret:
+                headers["Authorization"] = f"Bearer {self.config.runner_secret}"
+                headers["X-Runner-Secret"] = self.config.runner_secret
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                accounts = []
+                # 1. Primary candidate account
+                if data.get("has_account") and data.get("account"):
+                    accounts.append(data.get("account"))
+                # 2. Additional pool candidates for auto-failover & rotation
+                for acc in data.get("accounts_pool", []):
+                    if not any(a.get("id") == acc.get("id") for a in accounts):
+                        accounts.append(acc)
+                return accounts
+        except Exception as e:
+            logger.debug(f"Backend candidate accounts fetch note: {e}")
+        return []
 
     def _run_stream_session(self, account=None):
         acc_label = f"[{account.get('username')}]" if account and isinstance(account, dict) and account.get('username') else (f"[{account.username}]" if account and hasattr(account, 'username') else "[Guest-Viewer]")
@@ -727,9 +785,6 @@ class TikTokBoosterOrchestrator:
         if self.adb.is_login_or_signup_screen():
             logger.info("Screen is on login/signup page. Auto-dismissing to enter Live Room...")
             self.adb.dismiss_popups()
-            if self.adb.is_login_or_signup_screen():
-                self.adb.shell("input keyevent 4")
-                time.sleep(1)
             # Re-trigger live room navigation intent
             if self.config.stream_url:
                 self.adb.shell(f'am start -a android.intent.action.VIEW -d "{self.config.stream_url}" {self.adb.package_name}')
@@ -738,7 +793,13 @@ class TikTokBoosterOrchestrator:
         if self.adb.is_live_stream_active():
             self.transition_state(RunnerState.WATCHING, reason="TikTok Live stream player confirmed active and receiving video")
         else:
-            self.transition_state(RunnerState.OPENING_LIVE, reason="Waiting for live player buffer to confirm active stream")
+            logger.info("Live player not confirmed active yet; kickstarting video surface...")
+            self.adb.kickstart_video_surface()
+            time.sleep(2)
+            if self.adb.is_live_stream_active():
+                self.transition_state(RunnerState.WATCHING, reason="TikTok Live stream player confirmed active after kickstart")
+            else:
+                self.transition_state(RunnerState.OPENING_LIVE, reason="Waiting for live player buffer to confirm active stream")
 
         self.send_heartbeat(include_screenshot=True, reason="Live room loaded, starting auto-liker loop")
 
@@ -750,6 +811,7 @@ class TikTokBoosterOrchestrator:
 
         last_burst_time = 0
         last_heartbeat_time = 0
+        last_screenshot_time = 0
         last_stream_reopen_time = time.time()
 
         self.transition_state(RunnerState.RUNNING, reason=f"Auto-liker active at {self.config.likes_per_minute} likes/min target")
@@ -770,21 +832,29 @@ class TikTokBoosterOrchestrator:
                     self.transition_state(RunnerState.RUNNING, reason="Live player active and tapping")
                 last_stream_reopen_time = now
 
-            # Execute Heart Likes Burst
+            # Execute Heart Likes Burst (high-speed loop with zero UI-dump overhead)
             if now - last_burst_time >= interval_between_bursts:
-                if self.adb.is_live_stream_active():
+                if self.adb._is_tiktok_in_foreground():
                     taps = self.adb.send_batch_likes(tap_count=taps_per_burst, delay_ms=120)
                     self.total_likes_sent += taps
-                else:
-                    self.adb.dismiss_popups()
                 last_burst_time = now
 
-            # Send Telemetry & Process Remote Commands every 2.5s
+            # Send Telemetry & Process Remote Commands every 2.5s; throttle heavy screencap to once every 30s
             if now - last_heartbeat_time >= 2.5:
-                self.send_heartbeat(include_screenshot=True)
+                take_shot = (now - last_screenshot_time >= 30.0)
+                self.send_heartbeat(include_screenshot=take_shot)
+                if take_shot:
+                    last_screenshot_time = now
                 last_heartbeat_time = now
 
             time.sleep(0.3)
+
+        if not self.is_running:
+            logger.info("Session stopped early by operator command. Exiting cleanly.")
+            self.transition_state(RunnerState.STOPPED, reason="Session terminated by operator")
+            self.stream_forwarder.stop()
+            self._notify_stop()
+            sys.exit(0)
 
         logger.info(f"Session finished after {int(time.time() - start_time)} seconds. Total likes sent: {self.total_likes_sent}")
         self.transition_state(RunnerState.COMPLETED, reason=f"Session duration completed normally ({self.config.duration_minutes}m)")
